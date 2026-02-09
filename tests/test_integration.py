@@ -259,6 +259,9 @@ def app_server(run_env):
         v = str(app_env.get(k, ""))
         if v.startswith("${") or v == "":
             del app_env[k]
+    # Remove MCP server's PYTHONPATH to avoid mixing venv packages
+    # with the system packages the app depends on
+    app_env.pop("PYTHONPATH", None)
 
     proc = subprocess.Popen(
         [system_python, "-m", "uvicorn", "app.main:app",
