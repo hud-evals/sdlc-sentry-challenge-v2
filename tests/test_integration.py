@@ -11,11 +11,14 @@ Requirements:
 - DATABASE_URL environment variable set
 """
 import os
+import signal
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 
+import httpx
 import pytest
 
 
@@ -185,54 +188,241 @@ class TestAppConfig:
         )
 
 
-class TestTaskFilter:
-    def test_task_list_filters_by_organization_id(self):
-        with open("app/routers/tasks.py") as f:
-            content = f.read()
+# ---------------------------------------------------------------------------
+# Behavioral test fixtures — starts the actual app against a test database
+# ---------------------------------------------------------------------------
 
-        assert "Task.organization_id ==" in content or "Task.organization_id==" in content, (
-            "Task list endpoint must filter by Task.organization_id, "
-            "not Task.id when organization_id parameter is provided"
+def _find_system_python():
+    for p in ["/usr/bin/python3", "/usr/bin/python"]:
+        if os.path.isfile(p):
+            return p
+    return sys.executable
+
+
+@pytest.fixture(scope="session")
+def app_server(run_env):
+    """Start the FastAPI app against a fresh test database, yield base URL."""
+    test_db = "tasktracker_test"
+    port = 9876
+    base_url = f"http://127.0.0.1:{port}"
+    system_python = _find_system_python()
+
+    api_env = _get_docker_compose_api_env()
+    _, pg_url = _find_postgres_url(api_env)
+    assert pg_url, "No postgresql:// URL found in docker-compose.yml"
+
+    test_db_url = pg_url.rsplit("/", 1)[0] + f"/{test_db}"
+
+    import psycopg2
+
+    conn = psycopg2.connect(pg_url)
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute(f"DROP DATABASE IF EXISTS {test_db}")
+    cur.execute(f"CREATE DATABASE {test_db} OWNER tasktracker")
+    cur.close()
+    conn.close()
+
+    alembic_bin = _find_alembic_bin()
+    assert alembic_bin, "alembic not found"
+
+    mig_env = {**run_env}
+    for key in list(mig_env.keys()):
+        if "postgresql://" in str(mig_env.get(key, "")):
+            mig_env[key] = test_db_url
+    mig_env["DATABASE_URL"] = test_db_url
+
+    result = subprocess.run(
+        [alembic_bin, "upgrade", "head"],
+        capture_output=True, text=True, env=mig_env, cwd=os.getcwd(),
+    )
+    assert result.returncode == 0, (
+        f"alembic upgrade head failed (exit {result.returncode}):\n"
+        f"stdout: {result.stdout[-500:]}\n"
+        f"stderr: {result.stderr[-500:]}"
+    )
+
+    app_env = {**os.environ}
+    app_env.update(mig_env)
+
+    proc = subprocess.Popen(
+        [system_python, "-m", "uvicorn", "app.main:app",
+         "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning"],
+        cwd=os.getcwd(),
+        env=app_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    ready = False
+    for _ in range(20):
+        try:
+            resp = httpx.get(f"{base_url}/health", timeout=2)
+            if resp.status_code == 200:
+                ready = True
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    if not ready:
+        proc.kill()
+        proc.wait()
+        stderr_out = ""
+        try:
+            stderr_out = proc.stderr.read().decode(errors="replace")[-1000:]
+        except Exception:
+            pass
+        pytest.fail(
+            f"App did not start within 10s on port {port}.\n"
+            f"stderr: {stderr_out}"
         )
 
-        assert "Task.id == organization_id" not in content, (
-            "Task list endpoint incorrectly filters by Task.id instead of "
-            "Task.organization_id — this returns wrong results"
+    yield base_url
+
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+    try:
+        conn = psycopg2.connect(pg_url)
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute(f"DROP DATABASE IF EXISTS {test_db}")
+        cur.close()
+        conn.close()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Behavioral tests (Bugs 4, 5, 6) — test actual API behavior via HTTP
+# ---------------------------------------------------------------------------
+
+class TestTaskFilterBehavior:
+    def test_task_list_filters_by_organization_id(self, app_server):
+        base = app_server
+
+        org_a = httpx.post(f"{base}/api/v1/organizations/", json={
+            "name": "Org Alpha", "slug": "org-alpha-test"
+        }, timeout=10).json()
+
+        org_b = httpx.post(f"{base}/api/v1/organizations/", json={
+            "name": "Org Beta", "slug": "org-beta-test"
+        }, timeout=10).json()
+
+        for title in ["Alpha Task 1", "Alpha Task 2"]:
+            resp = httpx.post(f"{base}/api/v1/tasks/", json={
+                "title": title, "organization_id": org_a["id"]
+            }, timeout=10)
+            assert resp.status_code == 201, f"Failed to create task: {resp.text}"
+
+        resp = httpx.post(f"{base}/api/v1/tasks/", json={
+            "title": "Beta Task 1", "organization_id": org_b["id"]
+        }, timeout=10)
+        assert resp.status_code == 201, f"Failed to create task: {resp.text}"
+
+        resp = httpx.get(
+            f"{base}/api/v1/tasks/",
+            params={"organization_id": org_a["id"]},
+            timeout=10,
+        )
+        assert resp.status_code == 200
+        tasks = resp.json()
+
+        org_a_tasks = [t for t in tasks if t["organization_id"] == org_a["id"]]
+        org_b_tasks = [t for t in tasks if t["organization_id"] == org_b["id"]]
+
+        assert len(org_a_tasks) >= 2, (
+            f"Expected at least 2 tasks for org {org_a['id']}, got {len(org_a_tasks)}. "
+            f"The organization_id filter may be broken."
+        )
+        assert len(org_b_tasks) == 0, (
+            f"Filtering by organization_id={org_a['id']} returned tasks from org "
+            f"{org_b['id']}. The filter is not working correctly."
         )
 
 
-class TestTaskResponse:
-    def test_due_date_in_response_schema(self):
-        with open("app/schemas.py") as f:
-            content = f.read()
+class TestTaskResponseBehavior:
+    def test_due_date_in_api_response(self, app_server):
+        base = app_server
 
-        import re
-        response_match = re.search(
-            r'class TaskResponse.*?(?=class |\Z)', content, re.DOTALL
+        org_resp = httpx.post(f"{base}/api/v1/organizations/", json={
+            "name": "Due Date Test Org", "slug": "duedate-test-org"
+        }, timeout=10)
+        org = org_resp.json()
+        org_id = org.get("id", 1)
+
+        create_resp = httpx.post(f"{base}/api/v1/tasks/", json={
+            "title": "Task with due date",
+            "organization_id": org_id,
+            "due_date": "2026-06-15T00:00:00",
+        }, timeout=10)
+        assert create_resp.status_code == 201, (
+            f"Failed to create task with due_date: {create_resp.text}"
         )
-        assert response_match, "TaskResponse class must exist in schemas.py"
+        task = create_resp.json()
+        task_id = task["id"]
 
-        response_class = response_match.group()
-        assert "due_date" in response_class, (
-            "TaskResponse must include 'due_date' field — "
-            "currently the field is missing from API responses"
+        get_resp = httpx.get(f"{base}/api/v1/tasks/{task_id}", timeout=10)
+        assert get_resp.status_code == 200
+        task_data = get_resp.json()
+
+        assert "due_date" in task_data, (
+            f"API response for task {task_id} is missing 'due_date' field. "
+            f"Response keys: {list(task_data.keys())}. "
+            f"The TaskResponse schema likely needs to include due_date."
+        )
+        assert task_data["due_date"] is not None, (
+            f"due_date was set to '2026-06-15T00:00:00' but API returned None."
         )
 
 
-class TestAuth:
-    def test_write_permission_reads_correct_state(self):
-        with open("app/auth.py") as f:
-            content = f.read()
+class TestAuthBehavior:
+    def test_non_admin_can_create_tasks(self, app_server):
+        base = app_server
 
-        assert "request.state.user_role" not in content, (
-            "Auth check reads 'request.state.user_role' but middleware "
-            "sets 'request.state.role' — this causes AttributeError "
-            "for non-admin users"
+        org_resp = httpx.post(f"{base}/api/v1/organizations/", json={
+            "name": "Auth Test Org", "slug": "auth-test-org"
+        }, timeout=10)
+        org = org_resp.json()
+        org_id = org.get("id", 1)
+
+        user_resp = httpx.post(f"{base}/api/v1/users/", json={
+            "username": "member_test_user",
+            "email": "member@test.com",
+            "full_name": "Test Member",
+            "role": "member",
+            "organization_id": org_id,
+        }, timeout=10)
+        assert user_resp.status_code == 201, (
+            f"Failed to create test user: {user_resp.text}"
+        )
+        user = user_resp.json()
+
+        task_resp = httpx.post(
+            f"{base}/api/v1/tasks/",
+            json={"title": "Member-created task", "organization_id": org_id},
+            headers={"X-User-Id": str(user["id"])},
+            timeout=10,
         )
 
-        assert "request.state.role" in content, (
-            "Auth permission check must read 'request.state.role' "
-            "to match what the AuthMiddleware sets"
+        assert task_resp.status_code != 500, (
+            f"Creating a task as a non-admin user returned 500. "
+            f"This likely means the permission check has an AttributeError. "
+            f"Response: {task_resp.text}"
+        )
+        assert task_resp.status_code != 403, (
+            f"Creating a task as a 'member' role user returned 403 Forbidden. "
+            f"Members should have write permissions. "
+            f"Response: {task_resp.text}"
+        )
+        assert task_resp.status_code in (200, 201), (
+            f"Expected 200 or 201 for task creation, got {task_resp.status_code}. "
+            f"Response: {task_resp.text}"
         )
 
 
@@ -268,6 +458,6 @@ class TestGuards:
         with open("app/middleware.py") as f:
             content = f.read()
         assert "class AuthMiddleware" in content, "AuthMiddleware must exist"
-        assert "request.state.role" in content, (
-            "AuthMiddleware must set request.state.role"
+        assert "request.state." in content, (
+            "AuthMiddleware must set a role attribute on request.state"
         )
