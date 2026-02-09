@@ -19,7 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.add_column(
         "tasks",
-        sa.Column("due_date", sa.DateTime(), server_default=sa.text("'not_set'"), nullable=True),
+        sa.Column("due_date", sa.DateTime(), nullable=True),
     )
 
 

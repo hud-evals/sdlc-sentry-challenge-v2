@@ -26,7 +26,7 @@ def list_tasks(
     query = db.query(Task)
 
     if organization_id:
-        query = query.filter(Task.id == organization_id)
+        query = query.filter(Task.organization_id == organization_id)
     if status:
         query = query.filter(Task.status == status)
     if priority:

@@ -65,6 +65,7 @@ class TaskResponse(BaseModel):
     description: Optional[str] = None
     status: Optional[str] = None
     priority: Optional[str] = None
+    due_date: Optional[datetime] = None
     assigned_to: Optional[int] = None
     organization_id: int
     created_at: datetime

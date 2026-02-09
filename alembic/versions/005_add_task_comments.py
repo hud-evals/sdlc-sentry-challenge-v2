@@ -30,10 +30,10 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(op.f("ix_comments_id"), "comments", ["id"], unique=False)
-    op.create_index(op.f("ix_comments_taks_id"), "comments", ["taks_id"], unique=False)
+    op.create_index(op.f("ix_comments_task_id"), "comments", ["task_id"], unique=False)
 
 
 def downgrade() -> None:
-    op.drop_index(op.f("ix_comments_taks_id"), table_name="comments")
+    op.drop_index(op.f("ix_comments_task_id"), table_name="comments")
     op.drop_index(op.f("ix_comments_id"), table_name="comments")
     op.drop_table("comments")
