@@ -199,6 +199,14 @@ def _find_system_python():
     return sys.executable
 
 
+def _resolve_pg_url(url):
+    """Replace docker-compose service hostnames with localhost for local testing."""
+    # docker-compose.yml uses 'db' as hostname; inside the grading container
+    # Postgres runs locally on localhost:5432
+    import re
+    return re.sub(r'@[^:/@]+:', '@localhost:', url)
+
+
 @pytest.fixture(scope="session")
 def app_server(run_env):
     """Start the FastAPI app against a fresh test database, yield base URL."""
@@ -210,6 +218,7 @@ def app_server(run_env):
     api_env = _get_docker_compose_api_env()
     _, pg_url = _find_postgres_url(api_env)
     assert pg_url, "No postgresql:// URL found in docker-compose.yml"
+    pg_url = _resolve_pg_url(pg_url)
 
     test_db_url = pg_url.rsplit("/", 1)[0] + f"/{test_db}"
 
