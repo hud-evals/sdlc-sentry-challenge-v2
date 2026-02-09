@@ -253,11 +253,11 @@ def app_server(run_env):
 
     app_env = {**os.environ}
     app_env.update(mig_env)
-
-    # Filter out unresolved shell variable references (e.g. ${SENTRY_DSN:-})
-    # that yaml.safe_load reads as literal strings from docker-compose.yml
+    # Strip shell variable expansions (e.g. ${SENTRY_DSN:-}) that YAML
+    # parses as literal strings — they'd crash Sentry SDK init etc.
     for k in list(app_env.keys()):
-        if str(app_env[k]).startswith("${"):
+        v = str(app_env.get(k, ""))
+        if v.startswith("${") or v == "":
             del app_env[k]
 
     proc = subprocess.Popen(
