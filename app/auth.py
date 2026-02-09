@@ -30,7 +30,6 @@ def require_auth(request: Request, db: Session = Depends(get_db)):
     return user
 
 
-# BUG 6: reads request.state.user_role but middleware sets request.state.role
 def require_write_permission(request: Request):
     try:
         role = request.state.user_role
