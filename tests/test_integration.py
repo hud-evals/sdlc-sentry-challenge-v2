@@ -254,6 +254,12 @@ def app_server(run_env):
     app_env = {**os.environ}
     app_env.update(mig_env)
 
+    # Filter out unresolved shell variable references (e.g. ${SENTRY_DSN:-})
+    # that yaml.safe_load reads as literal strings from docker-compose.yml
+    for k in list(app_env.keys()):
+        if str(app_env[k]).startswith("${"):
+            del app_env[k]
+
     proc = subprocess.Popen(
         [system_python, "-m", "uvicorn", "app.main:app",
          "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning"],
